@@ -1,102 +1,203 @@
+#define _DEFAULT_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
+#include <dirent.h>
 #include <unistd.h>
-#include <sys/types.h>
 #include <signal.h>
-#include <sys/wait.h>
+#include <string.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <errno.h>
+#include <time.h>
 
-pid_t monitor_pid = 0;
-int monitor_exiting = 0;
+#define CMD_FILE ".monitor_command"
+#define TREASURE_FILE "treasures.dat"
 
-void handle_sigchld(int sig) {
-    int status;
-    pid_t pid = waitpid(monitor_pid, &status, WNOHANG);
-    if (pid == monitor_pid) {
-        printf("[Monitor terminated with status %d]\n", status);
-        monitor_pid = 0;
-    }
+#ifndef DT_DIR
+#define DT_DIR 4
+#endif
+
+typedef struct {
+    int id;
+    char username[32];
+    double latitude;
+    double longitude;
+    char clue[128];
+    int value;
+} Treasure;
+
+volatile sig_atomic_t command_ready = 0;
+
+void sigusr1_handler(int sig) {
+    command_ready = 1;
 }
 
-void send_command_to_monitor(const char *cmd) {
-    if (monitor_pid == 0) {
-        printf("[Error] No monitor running.\n");
-        return;
-    }
-    FILE *f = fopen("command.txt", "w");
-    if (!f) {
-        perror("fopen");
-        return;
-    }
-    fprintf(f, "%s\n", cmd);
-    fclose(f);
-    kill(monitor_pid, SIGUSR1);
-    printf("[Command sent to monitor] %s\n", cmd);
+void delay_exit() {
+    dprintf(STDOUT_FILENO, "Monitor exiting in 3 seconds...\n");
+    sleep(3);
 }
 
-int main() {
-    char input[256];
-    struct sigaction sa;
-    sa.sa_handler = handle_sigchld;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_RESTART;
-    sigaction(SIGCHLD, &sa, NULL);
+void print_treasure(const Treasure *t) {
+    dprintf(STDOUT_FILENO, "Treasure ID: %d\n", t->id);
+    dprintf(STDOUT_FILENO, "User: %s\n", t->username);
+    dprintf(STDOUT_FILENO, "Coordinates: %.6f, %.6f\n", t->latitude, t->longitude);
+    dprintf(STDOUT_FILENO, "Clue: %s\n", t->clue);
+    dprintf(STDOUT_FILENO, "Value: %d\n", t->value);
+    dprintf(STDOUT_FILENO, "---------------------\n");
+}
 
-    printf("Welcome to Treasure Hub\n");
-    while (1) {
-        printf("> ");
-        fflush(stdout);
-        if (!fgets(input, sizeof(input), stdin)) break;
+void list_hunts() {
+    DIR *d = opendir(".");
+    if (!d) {
+        dprintf(STDOUT_FILENO, "Failed to open current directory: %s\n", strerror(errno));
+        return;
+    }
+    struct dirent *entry;
+    int hunt_count = 0;
 
-        input[strcspn(input, "\n")] = 0; // Remove newline
+    dprintf(STDOUT_FILENO, "Listing hunts:\n");
+    while ((entry = readdir(d)) != NULL) {
+        if (entry->d_type == DT_DIR) {
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+                continue;
 
-        if (strcmp(input, "start_monitor") == 0) {
-            if (monitor_pid != 0) {
-                printf("[Monitor is already running]\n");
-                continue;
+            char treasure_path[512];
+            snprintf(treasure_path, sizeof(treasure_path), "%s/%s", entry->d_name, TREASURE_FILE);
+
+            struct stat st;
+            if (stat(treasure_path, &st) == 0) {
+                off_t size = st.st_size;
+                int count = size / sizeof(Treasure);
+
+                dprintf(STDOUT_FILENO, "Hunt: %s - Treasures: %d\n", entry->d_name, count);
+                hunt_count++;
             }
-            monitor_pid = fork();
-            if (monitor_pid < 0) {
-                perror("fork");
-            } else if (monitor_pid == 0) {
-                execl("./monitor", "monitor", NULL);
-                perror("execl");
-                exit(1);
-            } else {
-                printf("[Monitor started - PID %d]\n", monitor_pid);
-            }
-        } else if (strcmp(input, "stop_monitor") == 0) {
-            if (monitor_pid == 0) {
-                printf("[No monitor is running]\n");
-                continue;
-            }
-            monitor_exiting = 1;
-            kill(monitor_pid, SIGTERM);
-        } else if (strcmp(input, "exit") == 0) {
-            if (monitor_pid != 0) {
-                printf("[Cannot exit: monitor is still running]\n");
-                continue;
-            }
+        }
+    }
+    if (hunt_count == 0) {
+        dprintf(STDOUT_FILENO, "No hunts found.\n");
+    }
+    closedir(d);
+}
+
+void list_treasures(const char *hunt_id) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", hunt_id, TREASURE_FILE);
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        dprintf(STDOUT_FILENO, "Failed to open treasures for hunt '%s': %s\n", hunt_id, strerror(errno));
+        return;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        dprintf(STDOUT_FILENO, "fstat failed: %s\n", strerror(errno));
+        close(fd);
+        return;
+    }
+
+    dprintf(STDOUT_FILENO, "Hunt: %s\n", hunt_id);
+    dprintf(STDOUT_FILENO, "Total treasure file size: %ld bytes\n", st.st_size);
+    dprintf(STDOUT_FILENO, "Last modification time: %s", ctime(&st.st_mtime));
+    dprintf(STDOUT_FILENO, "Treasures:\n");
+
+    Treasure t;
+    ssize_t r;
+    while ((r = read(fd, &t, sizeof(t))) == sizeof(t)) {
+        print_treasure(&t);
+    }
+
+    close(fd);
+}
+
+void view_treasure(const char *hunt_id, int treasure_id) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", hunt_id, TREASURE_FILE);
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        dprintf(STDOUT_FILENO, "Failed to open treasures for hunt '%s': %s\n", hunt_id, strerror(errno));
+        return;
+    }
+
+    Treasure t;
+    ssize_t r;
+    int found = 0;
+    while ((r = read(fd, &t, sizeof(t))) == sizeof(t)) {
+        if (t.id == treasure_id) {
+            dprintf(STDOUT_FILENO, "Treasure details:\n");
+            print_treasure(&t);
+            found = 1;
             break;
-        } else if (strncmp(input, "list_treasures", 15) == 0) {
-            // Example: list_treasures Hunt001
-            char hunt_id[128];
-            if (sscanf(input, "list_treasures %127s", hunt_id) == 1) {
-                char cmd[256];
-                snprintf(cmd, sizeof(cmd), "./treasure_manager --list %s", hunt_id);
-                send_command_to_monitor(cmd);
-            } else {
-                printf("Usage: list_treasures <hunt_id>\n");
-            }
-        } else {
-            if (monitor_exiting && monitor_pid != 0) {
-                printf("[Monitor is shutting down, please wait...]\n");
-                continue;
-            }
-            printf("[Unknown or unavailable command: '%s']\n", input);
         }
     }
 
-    printf("Goodbye.\n");
+    if (!found) {
+        dprintf(STDOUT_FILENO, "Treasure with ID %d not found in hunt '%s'.\n", treasure_id, hunt_id);
+    }
+
+    close(fd);
+}
+
+void process_command(const char *cmd) {
+    if (strcmp(cmd, "stop_monitor") == 0) {
+        delay_exit();
+        exit(0);
+    } else if (strcmp(cmd, "list_hunts") == 0) {
+        list_hunts();
+    } else if (strncmp(cmd, "list_treasures ", 15) == 0) {
+        const char *hunt_id = cmd + 15;
+        list_treasures(hunt_id);
+    } else if (strncmp(cmd, "view_treasure ", 14) == 0) {
+        const char *params = cmd + 14;
+        char hunt_id[128];
+        int treasure_id;
+
+        if (sscanf(params, "%127s %d", hunt_id, &treasure_id) == 2) {
+            view_treasure(hunt_id, treasure_id);
+        } else {
+            dprintf(STDOUT_FILENO, "Invalid view_treasure command format. Use: view_treasure <hunt_id> <treasure_id>\n");
+        }
+    } else {
+        dprintf(STDOUT_FILENO, "Unknown command: %s\n", cmd);
+    }
+}
+
+int main() {
+    struct sigaction sa;
+    sa.sa_handler = sigusr1_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGUSR1, &sa, NULL);
+
+    dprintf(STDOUT_FILENO, "Monitor started with PID %d\n", getpid());
+
+    while (1) {
+        pause();
+
+        if (command_ready) {
+            command_ready = 0;
+
+            int fd = open(CMD_FILE, O_RDONLY);
+            if (fd < 0) {
+                dprintf(STDOUT_FILENO, "Monitor: Cannot open command file: %s\n", strerror(errno));
+                continue;
+            }
+
+            char buf[256] = {0};
+            ssize_t n = read(fd, buf, sizeof(buf) - 1);
+            close(fd);
+
+            if (n > 0) {
+                buf[n] = '\0';
+                process_command(buf);
+            } else {
+                dprintf(STDOUT_FILENO, "Monitor: No command read\n");
+            }
+        }
+    }
+
     return 0;
 }

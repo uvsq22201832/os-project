@@ -1,6 +1,12 @@
-
-rm -f treasure_manager treasure_hub monitor
-gcc -o treasure_manager treasure_manager.c
+gcc -o treasure_hub treasure_hub.c
 gcc -o monitor monitor.c
-gcc -Wall -Wextra -O2 -g -o treasure_hub treasure_hub.c
+gcc -o calculate_score calculate_score.c
+
 ./treasure_hub
+
+
+start_monitor
+list_hunts
+list_treasures Hunt001
+view_treasure Hunt001 1
+calculate_score Hunt001

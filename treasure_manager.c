@@ -1,4 +1,3 @@
-// corrected treasure_manager.c for Linux/WSL (no O_BINARY)
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,161 +8,201 @@
 #include <time.h>
 #include <errno.h>
 
-#define TREASURE_FILE "treasures.dat"
+#define USERNAME_MAX 32
+#define CLUE_MAX 128
+#define RECORD_FILE "treasures.dat"
 #define LOG_FILE "logged_hunt"
-#define MAX_USERNAME 32
-#define MAX_CLUE 128
-#define MAX_ID 16
 
 typedef struct {
-    char id[MAX_ID];
-    char username[MAX_USERNAME];
+    int treasure_id;
+    char username[USERNAME_MAX];
     float latitude;
     float longitude;
-    char clue[MAX_CLUE];
+    char clue[CLUE_MAX];
     int value;
 } Treasure;
 
-void create_directory(const char *path) {
-    mkdir(path, 0777);
-}
-
-void get_treasure_file_path(char *buffer, const char *hunt_id) {
-    sprintf(buffer, "%s/%s", hunt_id, TREASURE_FILE);
-}
-
-void get_log_file_path(char *buffer, const char *hunt_id) {
-    sprintf(buffer, "%s/%s", hunt_id, LOG_FILE);
-}
-
-void log_action(const char *hunt_id, const char *action) {
+// Utility: log operation
+void log_operation(const char *hunt_id, const char *msg) {
     char path[256];
-    get_log_file_path(path, hunt_id);
-    FILE *f = fopen(path, "a");
-    if (f) {
-        fprintf(f, "%s\n", action);
-        fclose(f);
+    snprintf(path, sizeof(path), "%s/%s", hunt_id, LOG_FILE);
+    int fd = open(path, O_WRONLY | O_APPEND | O_CREAT, 0644);
+    if (fd >= 0) {
+        dprintf(fd, "%s\n", msg);
+        close(fd);
     }
 }
 
+// Utility: create symlink
+void create_symlink(const char *hunt_id) {
+    char target[256], linkname[256];
+    snprintf(target, sizeof(target), "%s/%s", hunt_id, LOG_FILE);
+    snprintf(linkname, sizeof(linkname), "logged_hunt-%s", hunt_id);
+    symlink(target, linkname);
+}
+
 void add_treasure(const char *hunt_id) {
-    create_directory(hunt_id);
-    char path[256];
-    get_treasure_file_path(path, hunt_id);
-    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
-    if (fd < 0) { perror("open"); return; }
+    mkdir(hunt_id, 0755);
+
+    char filepath[256];
+    snprintf(filepath, sizeof(filepath), "%s/%s", hunt_id, RECORD_FILE);
 
     Treasure t;
-    printf("ID: "); scanf("%15s", t.id);
-    printf("Username: "); scanf("%31s", t.username);
-    printf("Latitude: "); scanf("%f", &t.latitude);
-    printf("Longitude: "); scanf("%f", &t.longitude);
-    printf("Clue: "); getchar(); fgets(t.clue, MAX_CLUE, stdin);
-    t.clue[strcspn(t.clue, "\n")] = 0;
-    printf("Value: "); scanf("%d", &t.value);
+    printf("Enter treasure ID: ");
+    scanf("%d", &t.treasure_id);
+    printf("Enter username: ");
+    scanf("%s", t.username);
+    printf("Enter latitude: ");
+    scanf("%f", &t.latitude);
+    printf("Enter longitude: ");
+    scanf("%f", &t.longitude);
+    printf("Enter clue: ");
+    getchar(); // consume newline
+    fgets(t.clue, CLUE_MAX, stdin);
+    t.clue[strcspn(t.clue, "\n")] = '\0'; // remove newline
+    printf("Enter value: ");
+    scanf("%d", &t.value);
+
+    int fd = open(filepath, O_WRONLY | O_APPEND | O_CREAT, 0644);
+    if (fd < 0) {
+        perror("Error opening treasure file");
+        return;
+    }
 
     write(fd, &t, sizeof(Treasure));
     close(fd);
 
-    log_action(hunt_id, "ADD TREASURE");
+    log_operation(hunt_id, "Added a treasure.");
+    create_symlink(hunt_id);
 }
 
 void list_treasures(const char *hunt_id) {
-    char path[256];
-    get_treasure_file_path(path, hunt_id);
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) { perror("open"); return; }
+    char filepath[256];
+    snprintf(filepath, sizeof(filepath), "%s/%s", hunt_id, RECORD_FILE);
 
     struct stat st;
-    if (stat(path, &st) == -1) { perror("stat"); return; }
-    printf("Hunt: %s\nFile size: %ld bytes\nLast modified: %s\n",
+    if (stat(filepath, &st) == -1) {
+        perror("Could not stat treasure file");
+        return;
+    }
+
+    printf("Hunt: %s\nSize: %ld bytes\nLast modified: %s",
            hunt_id, st.st_size, ctime(&st.st_mtime));
 
+    int fd = open(filepath, O_RDONLY);
+    if (fd < 0) {
+        perror("Error opening treasure file");
+        return;
+    }
+
     Treasure t;
     while (read(fd, &t, sizeof(Treasure)) == sizeof(Treasure)) {
-        printf("[%s] %s (%.4f, %.4f), %d pts\n",
-               t.id, t.username, t.latitude, t.longitude, t.value);
+        printf("ID: %d, User: %s, (%.2f, %.2f), Value: %d, Clue: %s\n",
+               t.treasure_id, t.username, t.latitude, t.longitude, t.value, t.clue);
     }
+
     close(fd);
-    log_action(hunt_id, "LIST TREASURES");
 }
 
-void view_treasure(const char *hunt_id, const char *id) {
-    char path[256];
-    get_treasure_file_path(path, hunt_id);
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) { perror("open"); return; }
+void view_treasure(const char *hunt_id, int id) {
+    char filepath[256];
+    snprintf(filepath, sizeof(filepath), "%s/%s", hunt_id, RECORD_FILE);
+
+    int fd = open(filepath, O_RDONLY);
+    if (fd < 0) {
+        perror("Error opening treasure file");
+        return;
+    }
+
+    Treasure t;
+    while (read(fd, &t, sizeof(Treasure)) == sizeof(Treasure)) {
+        if (t.treasure_id == id) {
+            printf("Treasure ID: %d\nUser: %s\nCoordinates: (%.2f, %.2f)\nValue: %d\nClue: %s\n",
+                   t.treasure_id, t.username, t.latitude, t.longitude, t.value, t.clue);
+            close(fd);
+            return;
+        }
+    }
+
+    printf("Treasure with ID %d not found.\n", id);
+    close(fd);
+}
+
+void remove_treasure(const char *hunt_id, int id) {
+    char filepath[256], temp_filepath[256];
+    snprintf(filepath, sizeof(filepath), "%s/%s", hunt_id, RECORD_FILE);
+    snprintf(temp_filepath, sizeof(temp_filepath), "%s/temp.dat", hunt_id);
+
+    int fd_old = open(filepath, O_RDONLY);
+    int fd_new = open(temp_filepath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+
+    if (fd_old < 0 || fd_new < 0) {
+        perror("Error opening file");
+        return;
+    }
+
     Treasure t;
     int found = 0;
-    while (read(fd, &t, sizeof(Treasure)) == sizeof(Treasure)) {
-        if (strcmp(t.id, id) == 0) {
-            printf("ID: %s\nUser: %s\nCoordinates: %.4f, %.4f\nClue: %s\nValue: %d\n",
-                   t.id, t.username, t.latitude, t.longitude, t.clue, t.value);
+    while (read(fd_old, &t, sizeof(Treasure)) == sizeof(Treasure)) {
+        if (t.treasure_id == id) {
             found = 1;
-            break;
+            continue;
         }
+        write(fd_new, &t, sizeof(Treasure));
     }
-    if (!found) printf("Treasure not found.\n");
-    close(fd);
-    log_action(hunt_id, "VIEW TREASURE");
-}
 
-void remove_treasure(const char *hunt_id, const char *id) {
-    char path[256];
-    get_treasure_file_path(path, hunt_id);
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) { perror("open"); return; }
+    close(fd_old);
+    close(fd_new);
 
-    char tmp_path[256];
-    sprintf(tmp_path, "%s/tmp.dat", hunt_id);
-    int tmp_fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    Treasure t;
-    int removed = 0;
-
-    while (read(fd, &t, sizeof(Treasure)) == sizeof(Treasure)) {
-        if (strcmp(t.id, id) != 0) {
-            write(tmp_fd, &t, sizeof(Treasure));
-        } else {
-            removed = 1;
-        }
+    if (found) {
+        rename(temp_filepath, filepath);
+        log_operation(hunt_id, "Removed a treasure.");
+        printf("Treasure removed.\n");
+    } else {
+        remove(temp_filepath);
+        printf("Treasure with ID %d not found.\n", id);
     }
-    close(fd);
-    close(tmp_fd);
-    rename(tmp_path, path);
-    if (removed) printf("Treasure removed.\n");
-    else printf("Treasure not found.\n");
-    log_action(hunt_id, "REMOVE TREASURE");
 }
 
 void remove_hunt(const char *hunt_id) {
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "rm -rf %s", hunt_id);
-    system(cmd);
-    char linkname[256];
-    snprintf(linkname, sizeof(linkname), "logged_hunt-%s", hunt_id);
-    unlink(linkname);
-    printf("Hunt '%s' removed.\n", hunt_id);
+    char filepath[256];
+    snprintf(filepath, sizeof(filepath), "%s/%s", hunt_id, RECORD_FILE);
+    unlink(filepath);
+    snprintf(filepath, sizeof(filepath), "%s/%s", hunt_id, LOG_FILE);
+    unlink(filepath);
+    rmdir(hunt_id);
+
+    char symlink_name[256];
+    snprintf(symlink_name, sizeof(symlink_name), "logged_hunt-%s", hunt_id);
+    unlink(symlink_name);
+
+    printf("Hunt %s removed.\n", hunt_id);
 }
 
 int main(int argc, char *argv[]) {
     if (argc < 3) {
-        printf("Usage: %s --add|--list|--view|--remove_treasure|--remove <hunt_id> [<treasure_id>]\n", argv[0]);
+        fprintf(stderr, "Usage: %s --command hunt_id [id]\n", argv[0]);
         return 1;
     }
 
-    if (strcmp(argv[1], "--add") == 0) {
-        add_treasure(argv[2]);
-    } else if (strcmp(argv[1], "--list") == 0) {
-        list_treasures(argv[2]);
-    } else if (strcmp(argv[1], "--view") == 0 && argc >= 4) {
-        view_treasure(argv[2], argv[3]);
-    } else if (strcmp(argv[1], "--remove_treasure") == 0 && argc >= 4) {
-        remove_treasure(argv[2], argv[3]);
-    } else if (strcmp(argv[1], "--remove") == 0) {
-        remove_hunt(argv[2]);
+    const char *cmd = argv[1];
+    const char *hunt_id = argv[2];
+
+    if (strcmp(cmd, "--add") == 0) {
+        add_treasure(hunt_id);
+    } else if (strcmp(cmd, "--list") == 0) {
+        list_treasures(hunt_id);
+    } else if (strcmp(cmd, "--view") == 0 && argc == 4) {
+        int id = atoi(argv[3]);
+        view_treasure(hunt_id, id);
+    } else if (strcmp(cmd, "--remove_treasure") == 0 && argc == 4) {
+        int id = atoi(argv[3]);
+        remove_treasure(hunt_id, id);
+    } else if (strcmp(cmd, "--remove_hunt") == 0) {
+        remove_hunt(hunt_id);
     } else {
-        printf("Invalid command.\n");
-        return 1;
+        fprintf(stderr, "Invalid command or parameters.\n");
     }
+
     return 0;
 }
